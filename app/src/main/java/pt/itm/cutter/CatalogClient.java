@@ -9,6 +9,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -17,10 +18,36 @@ import java.util.Locale;
 
 final class CatalogClient {
     static final String BASE = "https://proscreen.celly.com/";
-    private static final String APP_VERSION = "1.3.20";
+
+    private static volatile String sessionId = "";
+    private static volatile String authEmail = "";
+    private static volatile String authPassword = "";
+
+    static synchronized void configureAuth(String email, String password, String session) {
+        authEmail = email == null ? "" : email.trim();
+        authPassword = password == null ? "" : password;
+        sessionId = session == null ? "" : session.trim();
+    }
+
+    static synchronized String login(String email, String password) throws Exception {
+        if (email == null || email.trim().isEmpty()) throw new IOException("Introduz o email da conta OEM.");
+        if (password == null || password.isEmpty()) throw new IOException("Introduz a palavra-passe da conta OEM.");
+
+        String u = BASE + "api/user/login?email=" + enc(email.trim()) + "&pwd=" + enc(password);
+        JSONObject root = postRaw(u, null, null);
+        JSONObject data = root.optJSONObject("data");
+        JSONObject buss = data == null ? null : data.optJSONObject("bussData");
+        String s = buss == null ? "" : first(buss, "sessionId");
+        if (s.isEmpty()) throw new IOException(message(root, "Não foi possível iniciar sessão no catálogo OEM."));
+
+        configureAuth(email, password, s);
+        return s;
+    }
+
+    static String currentSession() { return sessionId; }
 
     List<Models.Category> categories() throws Exception {
-        JSONObject root = post(BASE + "api/sysClassOne/find_list?maxWidth=720&appVersion=" + APP_VERSION, new JSONObject());
+        JSONObject root = postAuth("api/sysClassOne/find_list", null);
         JSONArray arr = arrayFrom(root);
         if (arr.length() == 0) throw new IOException(message(root, "Catálogo vazio"));
         ArrayList<Models.Category> out = new ArrayList<>();
@@ -30,7 +57,7 @@ final class CatalogClient {
             Models.Category c = new Models.Category();
             c.id = intOf(o, "id", "classOneId");
             c.name = bestName(o);
-            c.icon = absolute(first(o, "englishIcon", "icon", "coverIcon"));
+            c.icon = absolute(first(o, "icon", "englishIcon", "coverIcon"));
             if (c.id != 0 && !c.name.isEmpty()) out.add(c);
         }
         out.sort(Comparator.comparing(a -> a.name.toLowerCase(Locale.ROOT)));
@@ -42,7 +69,7 @@ final class CatalogClient {
         body.put("classOneId", cat.id);
         body.put("pageIndex", 1);
         body.put("pageSize", "5000");
-        JSONObject root = post(BASE + "api/sysClassTwo/find_page", body);
+        JSONObject root = postAuth("api/sysClassTwo/find_page", body);
         JSONArray arr = arrayFrom(root);
         if (arr.length() == 0) throw new IOException(message(root, "Sem marcas nesta categoria"));
         ArrayList<Models.Family> out = new ArrayList<>();
@@ -53,7 +80,7 @@ final class CatalogClient {
             f.id = intOf(o, "id", "classTwoId");
             f.classOneId = intOf(o, "classOneId");
             f.name = bestName(o);
-            f.icon = absolute(first(o, "englishIcon", "icon", "coverIcon"));
+            f.icon = absolute(first(o, "icon", "englishIcon", "coverIcon"));
             if (f.id != 0 && !f.name.isEmpty()) out.add(f);
         }
         out.sort(Comparator.comparing(a -> a.name.toLowerCase(Locale.ROOT)));
@@ -62,11 +89,10 @@ final class CatalogClient {
 
     List<Models.Product> products(Models.Category cat, Models.Family fam) throws Exception {
         JSONObject body = new JSONObject();
-        body.put("classOneId", cat.id);
         body.put("classTwoId", fam.id);
         body.put("pageIndex", 1);
         body.put("pageSize", "5000");
-        JSONObject root = post(BASE + "api/product/find_page", body);
+        JSONObject root = postAuth("api/product/find_page", body);
         JSONArray arr = arrayFrom(root);
         if (arr.length() == 0) throw new IOException(message(root, "Sem modelos nesta família"));
         ArrayList<Models.Product> out = new ArrayList<>();
@@ -82,10 +108,7 @@ final class CatalogClient {
 
     Models.Product detail(Models.Product p) throws Exception {
         if (p.file != null && !p.file.isEmpty()) return p;
-        JSONObject body = new JSONObject();
-        body.put("id", p.id);
-        body.put("productId", p.id);
-        JSONObject root = post(BASE + "api/product/find_detail", body);
+        JSONObject root = postAuth("api/product/find_detail?id=" + p.id, null);
         JSONObject o = objectFrom(root);
         if (o == null) return p;
         Models.Product d = parseProduct(o);
@@ -94,6 +117,7 @@ final class CatalogClient {
         if (d.classTwoId == 0) d.classTwoId = p.classTwoId;
         if (d.name.isEmpty()) d.name = p.name;
         if (d.cover.isEmpty()) d.cover = p.cover;
+        if (d.detail.isEmpty()) d.detail = p.detail;
         return d;
     }
 
@@ -125,15 +149,43 @@ final class CatalogClient {
         return p;
     }
 
-    private JSONObject post(String urlText, JSONObject body) throws Exception {
-        HttpURLConnection c = open(urlText);
+    private static synchronized JSONObject postAuth(String path, JSONObject body) throws Exception {
+        ensureSession();
+        JSONObject root = postRaw(BASE + path, body, sessionId);
+        if (isExpired(root) && !authEmail.isEmpty() && !authPassword.isEmpty()) {
+            login(authEmail, authPassword);
+            root = postRaw(BASE + path, body, sessionId);
+        }
+        return root;
+    }
+
+    private static void ensureSession() throws Exception {
+        if (!sessionId.isEmpty()) return;
+        if (!authEmail.isEmpty() && !authPassword.isEmpty()) {
+            login(authEmail, authPassword);
+            return;
+        }
+        throw new IOException("É necessário iniciar sessão no catálogo OEM.");
+    }
+
+    private static JSONObject postRaw(String urlText, JSONObject body, String session) throws Exception {
+        HttpURLConnection c = openStatic(urlText);
         c.setRequestMethod("POST");
         c.setRequestProperty("Accept", "application/json");
-        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        c.setDoOutput(true);
-        byte[] payload = (body == null ? "{}" : body.toString()).getBytes(StandardCharsets.UTF_8);
-        c.setFixedLengthStreamingMode(payload.length);
-        try (OutputStream out = c.getOutputStream()) { out.write(payload); }
+        if (session != null && !session.isEmpty()) c.setRequestProperty("sessionId", session);
+
+        if (body != null) {
+            c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            c.setDoOutput(true);
+            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
+            c.setFixedLengthStreamingMode(payload.length);
+            try (OutputStream out = c.getOutputStream()) { out.write(payload); }
+        } else {
+            c.setDoOutput(true);
+            c.setFixedLengthStreamingMode(0);
+            try (OutputStream out = c.getOutputStream()) { out.flush(); }
+        }
+
         int code = c.getResponseCode();
         InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
         String text = in == null ? "" : new String(readAll(in), StandardCharsets.UTF_8);
@@ -143,13 +195,20 @@ final class CatalogClient {
         return new JSONObject(text);
     }
 
-    private HttpURLConnection open(String urlText) throws Exception {
+    private HttpURLConnection open(String urlText) throws Exception { return openStatic(urlText); }
+
+    private static HttpURLConnection openStatic(String urlText) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(urlText).openConnection();
         c.setConnectTimeout(15000);
         c.setReadTimeout(30000);
         c.setUseCaches(false);
-        c.setRequestProperty("User-Agent", "ITM-Cutter/0.5 Android");
+        c.setRequestProperty("User-Agent", "ITM-Cutter/0.5.1 Android");
         return c;
+    }
+
+    private static boolean isExpired(JSONObject root) {
+        String m = message(root, "").toLowerCase(Locale.ROOT);
+        return m.contains("not logged in") || m.contains("session expired") || m.contains("session has expired");
     }
 
     static boolean looksLikeSjc(byte[] data) {
@@ -194,14 +253,11 @@ final class CatalogClient {
 
     private static JSONArray arrayFrom(JSONObject root) {
         JSONObject data = root.optJSONObject("data");
-        JSONArray a = arrays(data, "bussData", "list", "records", "rows");
-        if (a != null) return a;
         if (data != null) {
-            JSONObject page = data.optJSONObject("page");
-            a = arrays(page, "records", "list", "rows", "bussData");
+            JSONArray a = data.optJSONArray("bussData");
             if (a != null) return a;
         }
-        a = arrays(root, "bussData", "list", "records", "rows");
+        JSONArray a = root.optJSONArray("bussData");
         return a == null ? new JSONArray() : a;
     }
 
@@ -209,18 +265,7 @@ final class CatalogClient {
         JSONObject data = root.optJSONObject("data");
         if (data == null) return root;
         JSONObject o = data.optJSONObject("bussData");
-        if (o != null) return o;
-        o = data.optJSONObject("data");
         return o != null ? o : data;
-    }
-
-    private static JSONArray arrays(JSONObject o, String... keys) {
-        if (o == null) return null;
-        for (String k : keys) {
-            JSONArray a = o.optJSONArray(k);
-            if (a != null) return a;
-        }
-        return null;
     }
 
     private static String message(JSONObject root, String fallback) {
@@ -228,6 +273,10 @@ final class CatalogClient {
         String s = data == null ? "" : first(data, "errMsg", "message", "msg");
         if (s.isEmpty()) s = first(root, "errMsg", "message", "msg");
         return s.isEmpty() ? fallback : s;
+    }
+
+    private static String enc(String s) throws Exception {
+        return URLEncoder.encode(s, "UTF-8");
     }
 
     private static byte[] readAll(InputStream in) throws IOException {
