@@ -18,6 +18,7 @@ import java.util.Locale;
 
 final class CatalogClient {
     static final String BASE = "https://proscreen.celly.com/";
+    static final String DEFAULT_SERIAL = "DEVIA1020921084721";
 
     private static volatile String sessionId = "";
     private static volatile String authEmail = "";
@@ -42,6 +43,51 @@ final class CatalogClient {
 
         configureAuth(email, password, s);
         return s;
+    }
+
+    static boolean validateSerial(String serial) throws Exception {
+        if (serial == null || serial.trim().isEmpty()) throw new IOException("Número de série em falta.");
+        JSONObject root = postRaw(BASE + "api/sysSerial/isValid?serialNum=" + enc(serial.trim()), null, null);
+        JSONObject data = root.optJSONObject("data");
+        if (data == null) throw new IOException(message(root, "Não foi possível validar o número de série."));
+        if (data.optBoolean("bussData", false)) return true;
+        throw new IOException(message(root, "Número de série inválido, duplicado ou expirado."));
+    }
+
+    static void sendMailCode(String email) throws Exception {
+        if (email == null || email.trim().isEmpty()) throw new IOException("Introduz o email.");
+        JSONObject root = postRaw(BASE + "api/mail/sendCode?mail=" + enc(email.trim()), null, null);
+        JSONObject data = root.optJSONObject("data");
+        if (data == null) throw new IOException(message(root, "Não foi possível enviar o código."));
+        if (data.optBoolean("bussData", false)) return;
+        throw new IOException(message(root, "Não foi possível enviar o código de verificação."));
+    }
+
+    static int register(String email, String code, String password, String serial, String companyName, String countryName) throws Exception {
+        if (email == null || email.trim().isEmpty()) throw new IOException("Email em falta.");
+        if (code == null || code.trim().isEmpty()) throw new IOException("Código de verificação em falta.");
+        if (password == null || password.isEmpty()) throw new IOException("Palavra-passe em falta.");
+        if (serial == null || serial.trim().isEmpty()) throw new IOException("Número de série em falta.");
+
+        JSONObject body = new JSONObject();
+        body.put("code", code.trim());
+        body.put("email", email.trim());
+        body.put("password", password);
+        body.put("serialNum", serial.trim());
+        body.put("companyName", companyName == null ? "" : companyName.trim());
+        body.put("countryName", countryName == null || countryName.trim().isEmpty() ? "Portugal" : countryName.trim());
+
+        JSONObject root = postRaw(BASE + "api/user/register", body, null);
+        JSONObject data = root.optJSONObject("data");
+        if (data == null) throw new IOException(message(root, "Não foi possível criar a conta."));
+        Object buss = data.opt("bussData");
+        int userId = 0;
+        if (buss instanceof Number) userId = ((Number) buss).intValue();
+        else if (buss != null && buss != JSONObject.NULL) {
+            try { userId = Integer.parseInt(String.valueOf(buss)); } catch (Exception ignored) {}
+        }
+        if (userId > 0) return userId;
+        throw new IOException(message(root, "O servidor não aceitou o registo."));
     }
 
     static String currentSession() { return sessionId; }
@@ -202,7 +248,7 @@ final class CatalogClient {
         c.setConnectTimeout(15000);
         c.setReadTimeout(30000);
         c.setUseCaches(false);
-        c.setRequestProperty("User-Agent", "ITM-Cutter/0.5.1 Android");
+        c.setRequestProperty("User-Agent", "ITM-Cutter/0.5.2 Android");
         return c;
     }
 
